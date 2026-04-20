@@ -17,7 +17,8 @@ from google.cloud import compute_v1
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gcp-instance-bot")
 
-RUNNING_STATES = {"RUNNING", "STAGING", "PROVISIONING"}
+RUNNING_STATES = {"RUNNING"}
+IN_PROGRESS_STATES = {"STAGING", "PROVISIONING"}
 STOPPED_STATES = {"TERMINATED", "STOPPED", "STOPPING", "SUSPENDED"}
 
 RETRYABLE_ERROR_SUBSTRINGS = [
@@ -25,6 +26,9 @@ RETRYABLE_ERROR_SUBSTRINGS = [
     "QUOTA_EXCEEDED",
     "stockout",
     "does not have enough resources available",
+    "did not complete within",          # client-side operation timeout
+    "Operation timed out",
+    "503",                              # service unavailable
 ]
 
 
@@ -114,6 +118,11 @@ def provision_in_zone(
     if status in RUNNING_STATES:
         winner.try_claim(zone, "already_running")
         return {"zone": zone, "action": "already_running", "success": True}
+
+    if status in IN_PROGRESS_STATES:
+        # Prior op is still staging. Don't declare winner yet and don't spawn more.
+        logger.info(f"[{zone}] instance is {status} from a prior cycle, waiting")
+        return {"zone": zone, "action": f"awaiting_{status.lower()}", "success": False}
 
     if status in STOPPED_STATES:
         if mode != "snapshot":
