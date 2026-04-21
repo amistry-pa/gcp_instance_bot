@@ -132,7 +132,7 @@ def provision_in_zone(
         try:
             logger.info(f"[{zone}] starting existing instance")
             op = client.start(project=project, zone=zone, instance=instance_name)
-            op.result(timeout=300)
+            op.result(timeout=450)
         except Exception as e:
             return _classify_error(zone, "start", e)
         if winner.try_claim(zone, "started"):
@@ -159,7 +159,7 @@ def provision_in_zone(
     try:
         logger.info(f"[{zone}] creating instance ({'snapshot' if source_snapshot_link else 'fresh'})")
         op = client.insert(request=request)
-        op.result(timeout=300)
+        op.result(timeout=450)
     except gcp_exceptions.Conflict:
         # Race with another process; treat as existing
         return {"zone": zone, "action": "conflict", "success": False}
@@ -173,7 +173,7 @@ def provision_in_zone(
     logger.warning(f"[{zone}] won but another zone beat us; deleting duplicate")
     try:
         del_op = client.delete(project=project, zone=zone, instance=instance_name)
-        del_op.result(timeout=300)
+        del_op.result(timeout=450)
         return {"zone": zone, "action": "deleted_duplicate", "success": False}
     except Exception as e:
         logger.error(f"[{zone}] failed to delete duplicate: {e}")
@@ -233,6 +233,37 @@ def send_email(subject: str, html: str) -> None:
         logger.error(f"Email send failed: {e}")
 
 
+def cleanup_orphan_duplicates(
+    project: str, instance_name: str, winning_zone: str, all_zones: list[str]
+) -> list[str]:
+    """Delete any same-named instance in losing zones that is STAGING/PROVISIONING.
+    These are usually leftovers from prior cycles whose client-side op timed out.
+    Does NOT touch RUNNING instances in other zones (those are likely intentional).
+    Returns list of zones cleaned up.
+    """
+    client = compute_v1.InstancesClient()
+    cleaned = []
+    for zone in all_zones:
+        if zone == winning_zone:
+            continue
+        try:
+            inst = client.get(project=project, zone=zone, instance=instance_name)
+        except gcp_exceptions.NotFound:
+            continue
+        except Exception as e:
+            logger.warning(f"[{zone}] cleanup probe failed: {e}")
+            continue
+        if inst.status in IN_PROGRESS_STATES:
+            logger.info(f"[{zone}] deleting orphan {inst.status} instance")
+            try:
+                op = client.delete(project=project, zone=zone, instance=instance_name)
+                op.result(timeout=300)
+                cleaned.append(zone)
+            except Exception as e:
+                logger.error(f"[{zone}] orphan delete failed: {e}")
+    return cleaned
+
+
 def pause_scheduler(project: str, region: str, job_name: str) -> None:
     try:
         creds, _ = google.auth.default()
@@ -253,11 +284,16 @@ def pause_scheduler(project: str, region: str, job_name: str) -> None:
 @functions_framework.http
 def provision_instance(request):
     """Cloud Function entry point. Triggered by Cloud Scheduler."""
+    required = ("GCP_PROJECT_ID", "INSTANCE_NAME", "PREFERRED_ZONES", "MACHINE_TYPE")
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        return (f"Missing required env vars: {missing}", 400)
+
     project = os.environ["GCP_PROJECT_ID"]
     instance_name = os.environ["INSTANCE_NAME"]
     zones = [z.strip() for z in os.environ["PREFERRED_ZONES"].split(",") if z.strip()]
     mode = os.environ.get("MODE", "snapshot").lower()
-    machine_type = os.environ.get("MACHINE_TYPE", "a3-highgpu-8g")
+    machine_type = os.environ["MACHINE_TYPE"]
     boot_disk_size = int(os.environ.get("BOOT_DISK_SIZE_GB", "200"))
     disk_type = os.environ.get("BOOT_DISK_TYPE", "pd-ssd")
     boot_image_project = os.environ.get("BOOT_IMAGE_PROJECT", "debian-cloud")
@@ -295,18 +331,21 @@ def provision_instance(request):
             results.append(future.result())
 
     if winner.zone:
+        cleaned = cleanup_orphan_duplicates(project, instance_name, winner.zone, zones)
         console_url = (
             f"https://console.cloud.google.com/compute/instancesDetail/"
             f"zones/{winner.zone}/instances/{instance_name}?project={project}"
         )
         source_desc = f"from snapshot <b>{snapshot_name}</b>" if snapshot_link else "fresh"
         action_label = winner.action.replace("_", " ")
+        cleanup_note = f"<p>Cleaned up orphan staging instances in: {cleaned}</p>" if cleaned else ""
         send_email(
             f"[GCP Bot] {instance_name} {action_label} in {winner.zone}",
             f"<h2>GPU Instance Ready</h2>"
             f"<p>Instance <b>{instance_name}</b> (<code>{machine_type}</code>) "
             f"{action_label} {source_desc} in <b>{winner.zone}</b> at {now}.</p>"
             f"<p><a href='{console_url}'>View in Console</a></p>"
+            f"{cleanup_note}"
             f"<p>Zone results: <pre>{results}</pre></p>"
             f"<p><i>The retry bot has been automatically paused.</i></p>",
         )
@@ -314,7 +353,8 @@ def provision_instance(request):
             pause_scheduler(project, scheduler_region, scheduler_job)
         return (f"Winner: {winner.zone} ({winner.action})", 200)
 
-    # All zones failed. Distinguish stockout from hard errors.
+    # Determine whether to log "exhausted" vs "awaiting"
+    awaiting = [r for r in results if r.get("action", "").startswith("awaiting_")]
     errors = [r for r in results if r.get("action", "").endswith("_error")]
     if errors:
         send_email(
@@ -325,6 +365,10 @@ def provision_instance(request):
             f"<p>Timestamp: {now}</p>",
         )
         return (f"Non-retryable errors: {errors}", 500)
+
+    if awaiting:
+        logger.info(f"Some zones have in-progress staging; waiting: {awaiting}")
+        return ("Awaiting in-progress staging, will retry next cycle", 200)
 
     logger.warning(f"All zones exhausted: {results}")
     return ("All zones exhausted, will retry next cycle", 200)
