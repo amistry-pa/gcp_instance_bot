@@ -24,10 +24,12 @@ STOPPED_STATES = {"TERMINATED", "STOPPED", "STOPPING", "SUSPENDED"}
 RETRYABLE_ERROR_SUBSTRINGS = [
     "ZONE_RESOURCE_POOL_EXHAUSTED",
     "QUOTA_EXCEEDED",
+    "RESOURCE_OPERATION_RATE_EXCEEDED",  # snapshot/resource rate limit
     "stockout",
     "does not have enough resources available",
     "did not complete within",          # client-side operation timeout
     "Operation timed out",
+    "Too frequent operations",
     "503",                              # service unavailable
 ]
 
